@@ -22,7 +22,7 @@ tikv-client = "0.4"
 
 ### Prerequisites
 
-- [`rust`](https://www.rust-lang.org/) >= `1.56.1`, required for `hashbrown-v0.12.1`
+- [`rust`](https://www.rust-lang.org/) — rustup uses the pinned toolchain from [`rust-toolchain.toml`](rust-toolchain.toml) automatically; the minimum supported version is the `rust-version` field in [`Cargo.toml`](Cargo.toml)
 
 The general flow of using the client crate is to create either a raw or transaction client object (which can be configured) then send commands using the client object, or use it to create transactions objects. In the latter case, the transaction is built up using various commands and then committed (or rolled back).
 
@@ -109,11 +109,11 @@ Important note: It is **not recommended or supported** to use both the raw and t
 
 # Development and contributing
 
-We welcome your contributions! Contributing code is great, we also appreciate filing [issues](https://github.com/tikv/client-rust/issues/new) to identify bugs and provide feedback, adding tests or examples, and improvements to documentation.
+We welcome your contributions! Contributing code is great, we also appreciate filing [issues](https://github.com/tikv/client-rust/issues/new) to identify bugs and provide feedback, adding tests or examples, and improvements to documentation. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide (DCO sign-off, PR process, building and testing).
 
 ## Building and testing
 
-We use the standard Cargo workflows, e.g., `cargo build` to build and `cargo test/nextest` to run unit tests. You will need to use a nightly Rust toolchain to build and run tests. Could use [nextest](https://nexte.st/index.html) to speed up ut, install nextest first.
+We use the standard Cargo workflows, e.g., `cargo build` to build and `cargo test/nextest` to run unit tests. rustup automatically uses the stable toolchain pinned in `rust-toolchain.toml` — no nightly is required. Could use [nextest](https://nexte.st/index.html) to speed up ut, install nextest first.
 
 ```
 cargo install cargo-nextest --locked
