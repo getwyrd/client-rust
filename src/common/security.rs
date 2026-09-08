@@ -92,6 +92,15 @@ impl SecurityManager {
     /// from its kernel (which keeps running when the process does not) and then
     /// never answer the HTTP/2 preface, hanging an unbounded connect until the
     /// peer thaws (#516).
+    ///
+    /// The same bound is handed to the endpoint as tonic's `connect_timeout`,
+    /// which caps the TCP connection phase — tonic installs it on hyper's
+    /// `HttpConnector` — and keeps applying to reconnects the channel makes on
+    /// its own. It stops there, though: TLS and the HTTP/2 handshake both run
+    /// after the connector returns, so only the outer deadline covers them,
+    /// and the handshake is where a frozen peer actually strands the dial.
+    /// Whichever bound trips first decides the error a caller sees — tonic's
+    /// transport error from the connector, or the descriptive one below.
     pub async fn connect_with_timeout<Factory, Client>(
         &self,
         // env: Arc<Environment>,
@@ -108,6 +117,7 @@ impl SecurityManager {
         } else {
             self.default_channel(addr).await?
         };
+        let channel = channel.connect_timeout(connect_timeout);
         let ch = tokio::time::timeout(connect_timeout, channel.connect())
             .await
             .map_err(|_| {
