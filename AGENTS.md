@@ -8,7 +8,7 @@ not part of any upstream PR.
 
 The standing rubric the loop's builder, reviewer and adversary apply
 (`client-rust-pdca` `pdca.toml` `rubric_file`). The client rules are condensed from
-client-rust-test's [`docs/client-rules.md`](https://github.com/getwyrd/client-rust-test/blob/main/docs/client-rules.md),
+client-rust-test's [`docs/design/specs/client-rules/v1.md`](https://github.com/getwyrd/client-rust-test/blob/main/docs/design/specs/client-rules/v1.md),
 the normative source: on any disagreement that file wins, and this section is stale. The
 same section lives in client-rust-test's `AGENTS.md`; keep the two in step.
 
@@ -25,7 +25,7 @@ same section lives in client-rust-test's `AGENTS.md`; keep the two in step.
 - **No new dependency, no build-time code, no `unsafe`** without a human: those are R2
   changes the loop parks for review, and `build.rs` / `proto-build/` changes are refused.
 
-### Client rules a change to tikv-client must not break (MUST; source: client-rust-test's `docs/client-rules.md`)
+### Client rules a change to tikv-client must not break (MUST; source: client-rust-test's `docs/design/specs/client-rules/v1.md`)
 
 One line per rule, kept to the source's conditions. `*` marks a conditional MUST: it binds
 only if the client uses that capability. Where a line and the source differ, the source
