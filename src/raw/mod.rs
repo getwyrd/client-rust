@@ -83,6 +83,21 @@ impl fmt::Display for ColumnFamily {
     }
 }
 
+/// The server-side checksum of a raw key range, as returned by
+/// [`raw::Client::checksum`](Client::checksum).
+///
+/// TiKV computes it with the CRC64-XOR algorithm: the CRC64 of each key-value pair, XORed
+/// together, so it does not depend on key order or on how the range is split into regions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct RawChecksum {
+    /// The XOR of the CRC64 of every key-value pair in the range.
+    pub crc64_xor: u64,
+    /// The number of key-value pairs in the range.
+    pub total_kvs: u64,
+    /// The total size, in bytes, of the keys and values in the range.
+    pub total_bytes: u64,
+}
+
 trait RawRpcRequest: Default {
     fn set_cf(&mut self, cf: String);
 

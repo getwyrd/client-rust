@@ -1,5 +1,6 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
+use super::RawChecksum;
 use super::RawRpcRequest;
 use crate::collect_single;
 use crate::kv::KvPairTTL;
@@ -604,6 +605,55 @@ impl
     }
 }
 
+pub fn new_raw_checksum_request(ranges: Vec<kvrpcpb::KeyRange>) -> kvrpcpb::RawChecksumRequest {
+    let mut req = kvrpcpb::RawChecksumRequest::default();
+    req.algorithm = kvrpcpb::ChecksumAlgorithm::Crc64Xor.into();
+    req.ranges = ranges;
+    req
+}
+
+impl KvRequest for kvrpcpb::RawChecksumRequest {
+    type Response = kvrpcpb::RawChecksumResponse;
+}
+
+impl Shardable for kvrpcpb::RawChecksumRequest {
+    type Shard = Vec<kvrpcpb::KeyRange>;
+
+    fn shards(
+        &self,
+        pd_client: &Arc<impl PdClient>,
+    ) -> BoxStream<'static, Result<(Self::Shard, RegionWithLeader)>> {
+        region_stream_for_ranges(self.ranges.clone(), pd_client.clone())
+    }
+
+    fn apply_shard(&mut self, shard: Self::Shard) {
+        self.ranges = shard;
+    }
+
+    fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
+        self.set_leader(&store.region_with_leader)
+    }
+}
+
+/// Each region checksums only its own part of the range, so the parts combine the way
+/// CRC64-XOR is defined over a key set: the checksums XOR, the counts add up.
+impl Merge<kvrpcpb::RawChecksumResponse> for Collect {
+    type Out = RawChecksum;
+
+    fn merge(&self, input: Vec<Result<kvrpcpb::RawChecksumResponse>>) -> Result<Self::Out> {
+        input
+            .into_iter()
+            .try_fold(RawChecksum::default(), |acc, resp| {
+                let resp = resp?;
+                Ok(RawChecksum {
+                    crc64_xor: acc.crc64_xor ^ resp.checksum,
+                    total_kvs: acc.total_kvs + resp.total_kvs,
+                    total_bytes: acc.total_bytes + resp.total_bytes,
+                })
+            })
+    }
+}
+
 macro_rules! impl_raw_rpc_request {
     ($name: ident) => {
         impl RawRpcRequest for kvrpcpb::$name {
@@ -650,6 +700,8 @@ impl HasLocks for kvrpcpb::RawCasResponse {}
 
 impl HasLocks for kvrpcpb::RawCoprocessorResponse {}
 
+impl HasLocks for kvrpcpb::RawChecksumResponse {}
+
 #[cfg(test)]
 mod test {
     use std::any::Any;
@@ -664,6 +716,27 @@ mod test {
     use crate::proto::kvrpcpb;
     use crate::request::Keyspace;
     use crate::request::Plan;
+    use crate::Error;
+
+    /// A plan without `extract_error` hands the merge each region's result as is, so a
+    /// failed region must fail the checksum rather than drop out of it.
+    #[test]
+    fn test_raw_checksum_merge_fails_on_a_failed_region() {
+        let part = |checksum| {
+            Ok(kvrpcpb::RawChecksumResponse {
+                checksum,
+                total_kvs: 1,
+                ..Default::default()
+            })
+        };
+
+        let merged = Collect.merge(vec![part(1), Err(Error::Unimplemented), part(2)]);
+
+        assert!(
+            matches!(merged, Err(Error::Unimplemented)),
+            "want the failed region's error, got {merged:?}"
+        );
+    }
 
     #[rstest::rstest]
     #[case(Keyspace::Disable)]
