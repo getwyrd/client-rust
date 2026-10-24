@@ -15,6 +15,7 @@ use crate::pd::PdRpcClient;
 use crate::proto::kvrpcpb::{RawScanRequest, RawScanResponse};
 use crate::proto::metapb;
 use crate::raw::lowering::*;
+use crate::raw::RawChecksum;
 use crate::request::CollectSingle;
 use crate::request::EncodeKeyspace;
 use crate::request::KeyMode;
@@ -479,6 +480,36 @@ impl<PdC: PdClient> Client<PdC> {
             .plan();
         plan.execute().await?;
         Ok(())
+    }
+
+    /// Create a new 'checksum' request.
+    ///
+    /// Once resolved this request will result in the server-side checksum of all key-value
+    /// pairs lying in the given range: TiKV checksums each region's part of the range with the
+    /// CRC64-XOR algorithm and the parts are combined into one [`RawChecksum`]. The request
+    /// has no column family field, so the client's column family does not apply to it.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// # use tikv_client::{Config, RawChecksum, RawClient, IntoOwnedRange};
+    /// # use futures::prelude::*;
+    /// # futures::executor::block_on(async {
+    /// # let client = RawClient::new(vec!["192.168.0.100"]).await.unwrap();
+    /// let inclusive_range = "TiKV"..="TiDB";
+    /// let req = client.checksum(inclusive_range.into_owned());
+    /// let result: RawChecksum = req.await.unwrap();
+    /// # });
+    /// ```
+    pub async fn checksum(&self, range: impl Into<BoundRange>) -> Result<RawChecksum> {
+        debug!("invoking raw checksum request");
+        let range = range.into().encode_keyspace(self.keyspace, KeyMode::Raw);
+        let request = new_raw_checksum_request(range);
+        let plan = crate::request::PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
+            .retry_multi_region(self.backoff.clone())
+            .extract_error()
+            .merge(Collect)
+            .plan();
+        plan.execute().await
     }
 
     /// Create a new 'scan' request.
@@ -1018,6 +1049,247 @@ mod tests {
         let ttls = vec![0, 0];
         assert!(client.batch_put_with_ttl(pairs, ttls).await.is_ok());
         Ok(())
+    }
+
+    /// The `RawChecksumRequest`s the mock TiKV received.
+    type SentChecksums = Arc<std::sync::Mutex<Vec<kvrpcpb::RawChecksumRequest>>>;
+
+    /// A mock TiKV that answers every `RawChecksumRequest` with `respond`, records it, and
+    /// fails on any other request.
+    fn checksum_kv_client(
+        respond: impl Fn(&kvrpcpb::RawChecksumRequest) -> kvrpcpb::RawChecksumResponse
+            + Send
+            + Sync
+            + 'static,
+    ) -> (MockKvClient, SentChecksums) {
+        let sent = SentChecksums::default();
+        let recorded = sent.clone();
+        let kv_client = MockKvClient::with_dispatch_hook(move |req: &dyn Any| {
+            let req = req
+                .downcast_ref::<kvrpcpb::RawChecksumRequest>()
+                .expect("a checksum sends only RawChecksumRequests");
+            recorded.lock().unwrap().push(req.clone());
+            Ok(Box::new(respond(req)) as Box<dyn Any>)
+        });
+        (kv_client, sent)
+    }
+
+    fn checksum_test_client(pd_client: MockPdClient, keyspace: Keyspace) -> Client<MockPdClient> {
+        Client {
+            rpc: Arc::new(pd_client),
+            cf: None,
+            backoff: DEFAULT_REGION_BACKOFF,
+            atomic: false,
+            keyspace,
+        }
+    }
+
+    fn region_id(req: &kvrpcpb::RawChecksumRequest) -> u64 {
+        req.context.as_ref().unwrap().region_id
+    }
+
+    fn checksum_part(
+        checksum: u64,
+        total_kvs: u64,
+        total_bytes: u64,
+    ) -> kvrpcpb::RawChecksumResponse {
+        kvrpcpb::RawChecksumResponse {
+            checksum,
+            total_kvs,
+            total_bytes,
+            ..Default::default()
+        }
+    }
+
+    /// Each mock region's part of the checksum of `[5, 251)`. The parts share bits and
+    /// counts, so an OR, AND or sum in place of the XOR, an XOR or OR in place of a sum, or
+    /// a dropped region each give something other than `WHOLE_RANGE`.
+    fn region_part(region_id: u64) -> kvrpcpb::RawChecksumResponse {
+        match region_id {
+            1 => checksum_part(0b0011, 3, 30),
+            2 => checksum_part(0b0110, 5, 50),
+            3 => checksum_part(0b1100, 6, 60),
+            id => panic!("unexpected region {id}"),
+        }
+    }
+
+    const WHOLE_RANGE: RawChecksum = RawChecksum {
+        crc64_xor: 0b1001,
+        total_kvs: 14,
+        total_bytes: 140,
+    };
+
+    /// A sent checksum request as
+    /// `(region id, API version, algorithm, [(start key, end key)])`.
+    type SentChecksum = (u64, i32, i32, Vec<(Vec<u8>, Vec<u8>)>);
+
+    fn sent_ranges(sent: &SentChecksums) -> Vec<SentChecksum> {
+        let mut sent: Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|req| {
+                (
+                    region_id(req),
+                    req.context.as_ref().unwrap().api_version,
+                    req.algorithm,
+                    req.ranges
+                        .iter()
+                        .map(|r| (r.start_key.clone(), r.end_key.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        sent.sort();
+        sent
+    }
+
+    #[tokio::test]
+    async fn test_raw_checksum_combines_every_region() -> Result<()> {
+        let (kv_client, sent) = checksum_kv_client(|req| region_part(region_id(req)));
+        let client = checksum_test_client(MockPdClient::new(kv_client), Keyspace::Disable);
+
+        let checksum = client.checksum(vec![5]..vec![251]).await?;
+
+        assert_eq!(checksum, WHOLE_RANGE);
+        let v1 = kvrpcpb::ApiVersion::V1 as i32;
+        let crc64_xor = kvrpcpb::ChecksumAlgorithm::Crc64Xor as i32;
+        assert_eq!(
+            sent_ranges(&sent),
+            vec![
+                (1, v1, crc64_xor, vec![(vec![5], vec![10])]),
+                (2, v1, crc64_xor, vec![(vec![10], vec![250, 250])]),
+                (3, v1, crc64_xor, vec![(vec![250, 250], vec![251])]),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_raw_checksum_covers_a_split_region_once() -> Result<()> {
+        // Region 2 splits at [100] while the checksum runs, so TiKV refuses its first
+        // request. The retry must checksum each half exactly once: a range counted twice
+        // cancels out of the XOR, and a range never counted is missing from it.
+        let split = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let splitting = split.clone();
+        let (kv_client, sent) = checksum_kv_client(move |req| {
+            let epoch = req.context.as_ref().unwrap().region_epoch.as_ref().unwrap();
+            match (region_id(req), epoch.version) {
+                (2, 0) => {
+                    splitting.store(true, std::sync::atomic::Ordering::SeqCst);
+                    kvrpcpb::RawChecksumResponse {
+                        region_error: Some(crate::proto::errorpb::Error {
+                            epoch_not_match: Some(Default::default()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }
+                }
+                // Region 2's part, divided between its two halves.
+                (2, 1) => checksum_part(0b0100, 2, 20),
+                (4, 1) => checksum_part(0b0010, 3, 30),
+                (id, _) => region_part(id),
+            }
+        });
+        let half = |id, start_key: Vec<u8>, end_key: Vec<u8>| {
+            let mut region = MockPdClient::region2();
+            region.region.id = id;
+            region.region.start_key = start_key;
+            region.region.end_key = end_key;
+            region.region.region_epoch.as_mut().unwrap().version = 1;
+            region
+        };
+        let pd_client = MockPdClient::new(kv_client).with_region_for_key_hook(move |key| {
+            let key: &[u8] = key.into();
+            Ok(if key < &[10][..] {
+                MockPdClient::region1()
+            } else if key >= &[250, 250][..] {
+                MockPdClient::region3()
+            } else if !split.load(std::sync::atomic::Ordering::SeqCst) {
+                MockPdClient::region2()
+            } else if key < &[100][..] {
+                half(2, vec![10], vec![100])
+            } else {
+                half(4, vec![100], vec![250, 250])
+            })
+        });
+        let client = checksum_test_client(pd_client, Keyspace::Disable);
+
+        let checksum = client.checksum(vec![5]..vec![251]).await?;
+
+        assert_eq!(checksum, WHOLE_RANGE);
+        let v1 = kvrpcpb::ApiVersion::V1 as i32;
+        let crc64_xor = kvrpcpb::ChecksumAlgorithm::Crc64Xor as i32;
+        assert_eq!(
+            sent_ranges(&sent),
+            vec![
+                (1, v1, crc64_xor, vec![(vec![5], vec![10])]),
+                (2, v1, crc64_xor, vec![(vec![10], vec![100])]),
+                (2, v1, crc64_xor, vec![(vec![10], vec![250, 250])]),
+                (3, v1, crc64_xor, vec![(vec![250, 250], vec![251])]),
+                (4, v1, crc64_xor, vec![(vec![100], vec![250, 250])]),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_raw_checksum_encodes_keyspace() -> Result<()> {
+        let (kv_client, sent) = checksum_kv_client(|_| checksum_part(42, 1, 3));
+        let client = checksum_test_client(
+            MockPdClient::new(kv_client),
+            Keyspace::Enable { keyspace_id: 0 },
+        );
+
+        // The open end is capped at the next keyspace's prefix, so the server checksums
+        // keyspace 0 only; and the request is marked API V2, without which TiKV would
+        // refuse the prefixed keys.
+        let checksum = client.checksum(vec![5]..).await?;
+
+        assert_eq!(
+            checksum,
+            RawChecksum {
+                crc64_xor: 42,
+                total_kvs: 1,
+                total_bytes: 3,
+            }
+        );
+        assert_eq!(
+            sent_ranges(&sent),
+            vec![(
+                2,
+                kvrpcpb::ApiVersion::V2 as i32,
+                kvrpcpb::ChecksumAlgorithm::Crc64Xor as i32,
+                vec![(vec![b'r', 0, 0, 0, 5], vec![b'r', 0, 0, 1])]
+            )]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_raw_checksum_surfaces_server_error() {
+        let (kv_client, _) = checksum_kv_client(|req| {
+            let mut part = region_part(region_id(req));
+            if region_id(req) == 2 {
+                part.error = "checksum failed".to_owned();
+            }
+            part
+        });
+        let client = checksum_test_client(MockPdClient::new(kv_client), Keyspace::Disable);
+
+        let err = client
+            .checksum(vec![5]..vec![251])
+            .await
+            .expect_err("one failed region must fail the whole checksum, not shrink it");
+
+        // How per-region errors are wrapped is the retry layer's decision; what the
+        // checksum guarantees is that the failed region's own error reaches the caller,
+        // and nothing else does.
+        assert!(
+            err.to_string()
+                .ends_with(r#": [KvError { message: "checksum failed" }]"#),
+            "want exactly the failed region's error, got {err}"
+        );
     }
 
     #[tokio::test]

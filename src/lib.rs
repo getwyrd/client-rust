@@ -150,6 +150,8 @@ pub use crate::raw::Client as RawClient;
 #[doc(inline)]
 pub use crate::raw::ColumnFamily;
 #[doc(inline)]
+pub use crate::raw::RawChecksum;
+#[doc(inline)]
 pub use crate::request::RetryOptions;
 #[doc(inline)]
 pub use crate::timestamp::Timestamp;
